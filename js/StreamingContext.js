@@ -1,5 +1,14 @@
 import BlockingQueue from './utils/BlockingQueue.js';
 import { log } from './utils/logger.js';
+import { FRAME_SIZE } from './app/constants.js';
+
+const MIN_FRAMES_PER_CHUNK = 6;
+
+function computeMinimumChunkSamples(sampleRate, minAudioDuration) {
+    const base = Math.max(1, Math.round(sampleRate * minAudioDuration * 3));
+    const required = FRAME_SIZE * MIN_FRAMES_PER_CHUNK;
+    return Math.max(base, required);
+}
 
 // 音频流播放上下文类
 export class StreamingContext {
@@ -11,7 +20,7 @@ export class StreamingContext {
         this.sampleRate = sampleRate;
         this.channels = channels;
         this.minAudioDuration = minAudioDuration;
-        this.chunkSamples = Math.max(1, Math.round(this.sampleRate * this.minAudioDuration * 3));
+        this.chunkSamples = computeMinimumChunkSamples(this.sampleRate, this.minAudioDuration);
 
         // 初始化队列和状态
         this.queue = [];          // 已解码的PCM队列。正在播放
@@ -25,6 +34,17 @@ export class StreamingContext {
         this.lastPlayTime = 0;    // 上次播放的时间戳
         this.playbackChunkIndex = 0;
         this.chunkListeners = [];
+    }
+
+    resetForNewSession() {
+        this.queue = [];
+        this.pendingAudioBufferQueue = [];
+        this.playing = false;
+        this.endOfStream = false;
+        this.source = null;
+        this.totalSamples = 0;
+        this.lastPlayTime = this.audioContext?.currentTime ?? 0;
+        this.playbackChunkIndex = 0;
     }
 
     // 缓存音频数组
@@ -208,6 +228,14 @@ export class StreamingContext {
 
                 this.source = source;
                 this.lastPlayTime = now;
+                if (this.audioContext.state === 'suspended') {
+                    try {
+                        await this.audioContext.resume();
+                        log('音频上下文已恢复', 'debug');
+                    } catch (resumeError) {
+                        log(`恢复音频上下文失败: ${resumeError.message}`, 'warning');
+                    }
+                }
                 log(`开始播放第 ${chunkIndex} 个块，样本 ${floatSamples.length} (~${chunkDuration.toFixed(2)} 秒)`, 'info');
                 source.start();
             }

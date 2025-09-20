@@ -42,6 +42,7 @@ export class BlendshapeViewer {
         this.blendshapeUIBindings = new Map();
         this.activeSocket = null;
         this.pendingCommands = [];
+        this.normalizedBlendshapeMap = new Map();
 
         this.gltfLoader = new GLTFLoader();
         this.gltfLoader.setCrossOrigin('anonymous');
@@ -67,6 +68,11 @@ export class BlendshapeViewer {
 
         // create WritableStream API (or fallback object) for external integrations
         this.setupBlendshapeStreamInterface();
+    }
+
+    normalizeBlendshapeKey(name) {
+        if (!name) return '';
+        return name.toLowerCase().replace(/[^a-z0-9]/g, '');
     }
 
     ensureThreeScene() {
@@ -197,14 +203,29 @@ export class BlendshapeViewer {
 
     rebuildBlendshapeMap() {
         this.blendshapeMap = new Map();
+        this.normalizedBlendshapeMap = new Map();
         this.blendshapeTargets.forEach(target => {
             Object.entries(target.dictionary).forEach(([name, index]) => {
                 if (!this.blendshapeMap.has(name)) {
                     this.blendshapeMap.set(name, []);
                 }
                 this.blendshapeMap.get(name).push({ mesh: target.mesh, index });
+                const normalized = this.normalizeBlendshapeKey(name);
+                if (normalized && !this.normalizedBlendshapeMap.has(normalized)) {
+                    this.normalizedBlendshapeMap.set(normalized, name);
+                }
             });
         });
+    }
+
+    resolveBlendshapeName(name) {
+        if (!name) return null;
+        if (this.blendshapeMap.has(name)) return name;
+        const normalized = this.normalizeBlendshapeKey(name);
+        if (normalized && this.normalizedBlendshapeMap.has(normalized)) {
+            return this.normalizedBlendshapeMap.get(normalized);
+        }
+        return null;
     }
 
     updateBlendshapeControls() {
@@ -260,13 +281,19 @@ export class BlendshapeViewer {
     }
 
     setBlendshapeValue(name, value) {
-        if (!this.blendshapeMap.has(name)) return;
-        const targets = this.blendshapeMap.get(name);
+        const canonical = this.resolveBlendshapeName(name);
+        if (!canonical) return;
+        const targets = this.blendshapeMap.get(canonical);
         const clampedValue = Math.max(0, Math.min(1, value));
         targets.forEach(({ mesh, index }) => {
             mesh.morphTargetInfluences[index] = clampedValue;
         });
-        this.currentBlendshapeValues.set(name, clampedValue);
+        this.currentBlendshapeValues.set(canonical, clampedValue);
+        const binding = this.blendshapeUIBindings.get(canonical);
+        if (binding) {
+            binding.slider.value = clampedValue.toString();
+            binding.valueLabel.textContent = clampedValue.toFixed(2);
+        }
     }
 
     applyBlendshapeFrame(frame) {
@@ -277,11 +304,6 @@ export class BlendshapeViewer {
         Object.entries(frame).forEach(([name, value]) => {
             const clampedValue = Math.max(0, Math.min(1, Number(value)));
             this.setBlendshapeValue(name, clampedValue);
-            const binding = this.blendshapeUIBindings.get(name);
-            if (binding) {
-                binding.slider.value = clampedValue.toString();
-                binding.valueLabel.textContent = clampedValue.toFixed(2);
-            }
         });
 
         this.updateStreamStatus(`frame applied @ ${new Date().toLocaleTimeString()}`);
@@ -363,6 +385,35 @@ export class BlendshapeViewer {
         this.updateStreamStatus('model load failed');
     } finally {
         URL.revokeObjectURL(url);
+        }
+    }
+
+    async loadModelFromUrl(resourceUrl, displayName = 'default_model.glb') {
+        if (!resourceUrl) return;
+        try {
+            this.updateStreamStatus('loading model...');
+            const resolvedUrl = new URL(resourceUrl, document.baseURI).href;
+            const response = await fetch(resolvedUrl);
+            if (!response.ok) {
+                throw new Error(`${response.status} ${response.statusText}`);
+            }
+            const blob = await response.blob();
+            const fileName = displayName || resourceUrl.split('/').pop() || 'model.glb';
+            let file;
+            if (typeof File !== 'undefined') {
+                file = new File([blob], fileName, { type: blob.type || 'model/gltf-binary' });
+            } else {
+                file = blob;
+                try {
+                    Object.defineProperty(file, 'name', { value: fileName });
+                } catch (error) {
+                    // ignore if not configurable
+                }
+            }
+            await this.loadModelFile(file);
+        } catch (error) {
+            this.log(`默认模型加载失败: ${error.message}`, 'error');
+            this.updateStreamStatus('model load failed');
         }
     }
 

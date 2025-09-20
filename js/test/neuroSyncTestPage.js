@@ -19,6 +19,10 @@ document.addEventListener('DOMContentLoaded', () => {
         apiUrlInput.value = 'http://127.0.0.1:5000/audio_to_blendshapes';
     }
 
+    if (resultElement) {
+        resultElement.style.display = 'none';
+    }
+
     const forwarder = initNeuroSyncForwarder({
         apiUrlInput,
         statusElement,

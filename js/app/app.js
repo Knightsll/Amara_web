@@ -25,6 +25,10 @@ export function initApp() {
 
     state.blendshapeViewer = viewer;
 
+    if (viewer && typeof viewer.loadModelFromUrl === 'function') {
+        viewer.loadModelFromUrl('../character/Megumin Rig try to add skape key.glb', 'Megumin Rig.glb');
+    }
+
     initUI({
         onConnect: connectToServer,
         onSendText: sendTextMessage,

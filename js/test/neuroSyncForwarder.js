@@ -2,10 +2,12 @@ import { log } from '../utils/logger.js';
 import { initOpusDecoder, registerPlaybackChunkListener } from '../app/audio.js';
 import { state } from '../app/state.js';
 import { SAMPLE_RATE, CHANNELS, MIN_AUDIO_DURATION } from '../app/constants.js';
+import { parseNeuroSyncBlendshapeFrames, extractRawNeuroSyncFrames, resetNeuroSyncBlendshapeState } from './NeuroSync_to_Three_emotion.js';
 
 const FRAME_SIZE = 960;
 const FRAME_SIZE_BYTES = FRAME_SIZE * CHANNELS * 2;
-const CHUNK_SAMPLES = Math.max(1, Math.round(SAMPLE_RATE * MIN_AUDIO_DURATION * 3));
+const MIN_FRAMES_PER_CHUNK = 6; // NeuroSync minimum requirement
+const CHUNK_SAMPLES = FRAME_SIZE * MIN_FRAMES_PER_CHUNK;
 
 function encodeWav(int16Samples, sampleRate, channels) {
     const bytesPerSample = 2;
@@ -98,35 +100,6 @@ async function createStandaloneOpusDecoder() {
     };
 }
 
-function extractBlendshapeFrames(response, fallbackDuration) {
-    if (!response) return [];
-    let frames = [];
-    if (Array.isArray(response)) {
-        frames = response;
-    } else if (Array.isArray(response.frames)) {
-        frames = response.frames;
-    } else if (Array.isArray(response.blendshapes)) {
-        frames = response.blendshapes;
-    } else if (response.values && typeof response.values === 'object') {
-        frames = [{ time: 0, values: response.values }];
-    } else {
-        frames = [{ time: 0, values: response }];
-    }
-
-    const duration = Math.max(fallbackDuration, 0.0001);
-    if (!frames.length) return [];
-
-    return frames.map((frame, index) => {
-        const time = typeof frame.time === 'number'
-            ? Math.max(0, Math.min(duration, frame.time))
-            : (duration / Math.max(frames.length, 1)) * index;
-        const values = frame.values && typeof frame.values === 'object'
-            ? frame.values
-            : frame;
-        return { time, values };
-    });
-}
-
 export function initNeuroSyncForwarder({
     apiUrlInput,
     statusElement,
@@ -136,10 +109,12 @@ export function initNeuroSyncForwarder({
     let pcmAccumulator = new Int16Array(0);
     let decoderPromise = null;
     let chunkSequence = 0;
-    let postQueue = Promise.resolve();
-    const chunkStates = new Map(); // index -> { promise, resolve, data }
+    const chunkStates = new Map(); // index -> { promise, blendshape, duration, chunkSamples, session }
     const scheduledTimers = new Set();
-    let lastPostAbort = null;
+    const inflightControllers = new Set();
+    const blendshapeLog = [];
+    let currentSessionId = 0;
+    let hasAudioChunk = false;
 
     function updateStatus(text, level = 'info') {
         if (statusElement) {
@@ -162,12 +137,19 @@ export function initNeuroSyncForwarder({
     function resetSession() {
         scheduledTimers.forEach(timer => clearTimeout(timer));
         scheduledTimers.clear();
+        inflightControllers.forEach(controller => controller.abort());
+        inflightControllers.clear();
         pcmAccumulator = new Int16Array(0);
         chunkSequence = 0;
-        postQueue = Promise.resolve();
         chunkStates.clear();
+        resetNeuroSyncBlendshapeState();
         if (resultElement) {
-            resultElement.textContent = '(等待返回结果)';
+            resultElement.textContent = '';
+        }
+        blendshapeLog.length = 0;
+        hasAudioChunk = false;
+        if (state.streamingContext && typeof state.streamingContext.resetForNewSession === 'function') {
+            state.streamingContext.resetForNewSession();
         }
     }
 
@@ -198,34 +180,143 @@ export function initNeuroSyncForwarder({
     }
 
     function enqueueChunk(int16Samples, { finalChunk = false } = {}) {
+        if (!int16Samples || int16Samples.length === 0) {
+            return;
+        }
+
+        let samples = int16Samples;
+        if (samples.length < CHUNK_SAMPLES) {
+            const padded = new Int16Array(CHUNK_SAMPLES);
+            padded.set(samples);
+            samples = padded;
+        }
+
         const index = chunkSequence++;
         let resolveBlendshape;
-        let rejectBlendshape;
-        const blendshapePromise = new Promise((resolve, reject) => {
+        const blendshapePromise = new Promise((resolve) => {
             resolveBlendshape = resolve;
-            rejectBlendshape = reject;
         });
+
+        const playbackDuration = Math.max(int16Samples.length, FRAME_SIZE) / SAMPLE_RATE;
 
         const chunkState = {
             index,
             promise: blendshapePromise,
             resolve: resolveBlendshape,
-            reject: rejectBlendshape,
-            blendshape: null,
-            duration: int16Samples.length / SAMPLE_RATE,
-            finalChunk
+            blendshape: [],
+            duration: playbackDuration,
+            finalChunk,
+            chunkSamples: samples,
+            session: currentSessionId,
+            startInfo: null,
+            scheduled: false
         };
         chunkStates.set(index, chunkState);
+        hasAudioChunk = true;
 
-        postQueue = postQueue.then(() => postChunkToApi(int16Samples, index))
+        postChunkToApi(samples, index)
             .then(response => {
-                chunkState.blendshape = response;
-                chunkState.resolve(response);
+                const parsed = Array.isArray(response?.blendshapes) ? response.blendshapes : response;
+                const rawFrames = extractRawNeuroSyncFrames(parsed, { duration: chunkState.duration });
+                const rawArraySample = rawFrames[0]?.arrayValues ? Array.from(rawFrames[0].arrayValues).slice(0, 10) : null;
+                if (rawArraySample) {
+                    console.log('[NeuroSync] raw chunk', index + 1, rawArraySample.map(v => Number(v).toFixed(4)).join(', '));
+                } else if (rawFrames[0]?.values) {
+                    const sampleEntries = Object.entries(rawFrames[0].values).slice(0, 10);
+                    console.log('[NeuroSync] raw chunk', index + 1, sampleEntries.map(([k, v]) => `${k}:${Number(v).toFixed(4)}`).join(', '));
+                }
+                const frames = parseNeuroSyncBlendshapeFrames(parsed, { duration: chunkState.duration }, rawFrames);
+                chunkState.blendshape = frames;
+                chunkState.resolve(frames);
+                console.log('[NeuroSync] chunk', index + 1, 'resolved frames:', frames?.length ?? 0, 'session:', chunkState.session, 'current:', currentSessionId);
+                appendBlendshapeLogs(index + 1, rawFrames, chunkState.duration);
+                scheduleChunkFrames(chunkState);
             })
             .catch(error => {
                 updateStatus(`NeuroSync 请求失败 (chunk ${index}): ${error.message}`, 'error');
-                chunkState.resolve(null); // 允许音频继续播放
+                console.warn('[NeuroSync] chunk', index + 1, 'failed:', error);
+                chunkState.blendshape = [];
+                chunkState.resolve([]);
+                scheduleChunkFrames(chunkState);
             });
+    }
+
+    function scheduleChunkFrames(chunkState) {
+        if (chunkState.scheduled) return;
+        if (!chunkState.startInfo) return;
+        if (chunkState.session !== currentSessionId) return;
+        const frames = chunkState.blendshape;
+        if (!frames || !frames.length) return;
+
+        const viewer = state.blendshapeViewer;
+        if (!viewer || typeof viewer.applyBlendshapeFrame !== 'function') return;
+
+        const { startTime, audioContext } = chunkState.startInfo;
+
+        const firstFrame = frames[0]?.values || {};
+        const sampleEntries = Object.entries(firstFrame)
+            .slice(0, 6)
+            .map(([k, v]) => `${k}:${Number(v).toFixed(3)}`);
+        console.log('[NeuroSync] schedule chunk', chunkState.index + 1, sampleEntries.join(', '), 'timeOffset', frames[0]?.time ?? 0);
+
+        frames.forEach(frame => {
+            const delay = Math.max(0, frame.time);
+            const targetTime = startTime + delay;
+            const msDelay = Math.max(0, (targetTime - audioContext.currentTime) * 1000);
+            const timerId = setTimeout(() => {
+                scheduledTimers.delete(timerId);
+                try {
+                    viewer.applyBlendshapeFrame(frame.values);
+                } catch (error) {
+                    log(`应用NeuroSync表情帧失败: ${error.message}`, 'warning');
+                }
+            }, msDelay);
+            scheduledTimers.add(timerId);
+        });
+
+        chunkState.scheduled = true;
+    }
+
+    function appendBlendshapeLogs(chunkIndex, frames, chunkDuration) {
+        if (!frames || !frames.length) return;
+        frames.forEach(frame => {
+            blendshapeLog.push({
+                session: currentSessionId,
+                chunk: chunkIndex,
+                time: frame.time,
+                duration: chunkDuration,
+                values: frame.values
+            });
+        });
+    }
+
+    function flushBlendshapeLogsToCsv() {
+        // CSV 导出已停用；保留钩子以便后续恢复
+        blendshapeLog.length = 0;
+    }
+
+    function scheduleBlendshapeLogFlush() {
+        const pending = Array.from(chunkStates.values()).map(state => state.promise.catch(() => []));
+        if (pending.length === 0) {
+            flushBlendshapeLogsToCsv();
+            return;
+        }
+        Promise.allSettled(pending).finally(() => {
+            flushBlendshapeLogsToCsv();
+        });
+    }
+
+    function removeLastServerMessage() {
+        const conversation = document.getElementById('conversation');
+        if (!conversation) return;
+        const children = conversation.children;
+        for (let i = children.length - 1; i >= 0; i--) {
+            const child = children[i];
+            if (child.classList && child.classList.contains('message') && child.classList.contains('server')) {
+                conversation.removeChild(child);
+                break;
+            }
+        }
     }
 
     async function postChunkToApi(int16Samples, index) {
@@ -235,7 +326,7 @@ export function initNeuroSyncForwarder({
         }
         const wavBytes = encodeWav(int16Samples, SAMPLE_RATE, CHANNELS);
         const controller = new AbortController();
-        lastPostAbort = controller;
+        inflightControllers.add(controller);
         updateStatus(`发送第 ${index + 1} 个音频块到 NeuroSync...`, 'info');
         try {
             const response = await fetch(apiUrl, {
@@ -251,15 +342,10 @@ export function initNeuroSyncForwarder({
                 throw new Error(`${response.status} ${text}`);
             }
             const json = await response.json().catch(() => null);
-            if (resultElement) {
-                resultElement.textContent = JSON.stringify(json ?? {}, null, 2);
-            }
             updateStatus(`NeuroSync 块 ${index + 1} 响应成功`, 'success');
             return json;
         } finally {
-            if (lastPostAbort === controller) {
-                lastPostAbort = null;
-            }
+            inflightControllers.delete(controller);
         }
     }
 
@@ -268,42 +354,37 @@ export function initNeuroSyncForwarder({
         if (message.state === 'start') {
             collecting = true;
             resetSession();
-            updateStatus('开始收集小智语音流...', 'info');
+            if (state.streamingContext) {
+                state.streamingContext.playbackChunkIndex = 0;
+            }
+            currentSessionId = Date.now();
+            updateStatus('Collecting audio stream...', 'info');
         } else if (message.state === 'stop') {
             collecting = false;
             if (pcmAccumulator.length) {
                 enqueueChunk(pcmAccumulator.slice(), { finalChunk: true });
                 pcmAccumulator = new Int16Array(0);
             }
+            if (!hasAudioChunk) {
+                removeLastServerMessage();
+            }
+            scheduleBlendshapeLogFlush();
         }
     }
 
     registerPlaybackChunkListener((chunkInfo) => {
         const chunkState = chunkStates.get(chunkInfo.index);
-        if (!chunkState) {
+        if (!chunkState || chunkState.session !== currentSessionId) {
             return null;
         }
         return {
-            beforePlay: chunkState.promise,
+            beforePlay: Promise.race([
+                chunkState.promise.catch(() => []),
+                new Promise(resolve => setTimeout(resolve, 250))
+            ]),
             onStart: ({ startTime, audioContext }) => {
-                if (!chunkState.blendshape) return;
-                const viewer = state.blendshapeViewer;
-                if (!viewer || typeof viewer.applyBlendshapeFrame !== 'function') return;
-                const frames = extractBlendshapeFrames(chunkState.blendshape, chunkState.duration);
-                frames.forEach(frame => {
-                    const delay = Math.max(0, frame.time);
-                    const targetTime = startTime + delay;
-                    const msDelay = Math.max(0, (targetTime - audioContext.currentTime) * 1000);
-                    const timerId = setTimeout(() => {
-                        scheduledTimers.delete(timerId);
-                        try {
-                            viewer.applyBlendshapeFrame(frame.values);
-                        } catch (error) {
-                            log(`应用NeuroSync表情帧失败: ${error.message}`, 'warning');
-                        }
-                    }, msDelay);
-                    scheduledTimers.add(timerId);
-                });
+                chunkState.startInfo = { startTime, audioContext };
+                scheduleChunkFrames(chunkState);
             },
             onEnd: () => {
                 chunkStates.delete(chunkInfo.index);
@@ -312,21 +393,21 @@ export function initNeuroSyncForwarder({
     });
 
     window.addEventListener('beforeunload', () => {
-        if (lastPostAbort) {
-            lastPostAbort.abort();
-        }
+        inflightControllers.forEach(controller => controller.abort());
+        inflightControllers.clear();
         decoderPromise?.then(decoder => decoder.destroy()).catch(() => {});
+        scheduleBlendshapeLogFlush();
     });
 
     return {
         consumeBinaryFrame,
         handleServerMessage,
         cancelPendingUpload() {
-            if (lastPostAbort) {
-                lastPostAbort.abort();
-            }
+            inflightControllers.forEach(controller => controller.abort());
+            inflightControllers.clear();
             scheduledTimers.forEach(timer => clearTimeout(timer));
             scheduledTimers.clear();
+            scheduleBlendshapeLogFlush();
         }
     };
 }
