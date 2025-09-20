@@ -76,6 +76,14 @@ export async function initAudio() {
         log('已获取麦克风访问权限', 'success');
 
         state.audioContext = getAudioContextInstance();
+        if (state.audioContext && state.audioContext.state === 'suspended') {
+            try {
+                await state.audioContext.resume();
+                log('音频上下文已在录音前恢复', 'debug');
+            } catch (resumeError) {
+                log(`恢复音频上下文失败: ${resumeError.message}`, 'warning');
+            }
+        }
         const source = state.audioContext.createMediaStreamSource(stream);
         state.analyser = state.audioContext.createAnalyser();
         state.analyser.fftSize = 2048;
@@ -326,6 +334,15 @@ export function stopDirectRecording() {
 export async function createAudioProcessor() {
     state.audioContext = getAudioContextInstance();
     try {
+        if (state.audioContext.state === 'suspended') {
+            try {
+                await state.audioContext.resume();
+                log('音频上下文在创建处理器前恢复成功', 'debug');
+            } catch (resumeError) {
+                log(`创建处理器前恢复音频上下文失败: ${resumeError.message}`, 'warning');
+            }
+        }
+
         if (state.audioContext.audioWorklet) {
             const blob = new Blob([audioProcessorCode], { type: 'application/javascript' });
             const url = URL.createObjectURL(blob);
