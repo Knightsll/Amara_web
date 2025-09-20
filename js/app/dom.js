@@ -19,7 +19,9 @@ export const dom = {
     connectBlendshapeWsButton: document.getElementById('connectBlendshapeWs'),
     disconnectBlendshapeWsButton: document.getElementById('disconnectBlendshapeWs'),
     deviceMacInput: document.getElementById('deviceMac'),
+    deviceNameInput: document.getElementById('deviceName'),
     clientIdInput: document.getElementById('clientId'),
+    tokenInput: document.getElementById('token'),
     displayMac: document.getElementById('displayMac'),
     displayClient: document.getElementById('displayClient'),
     toggleConfig: document.getElementById('toggleConfig'),
@@ -29,5 +31,5 @@ export const dom = {
 };
 
 export function getVisualizerContext() {
-    return dom.visualizerCanvas.getContext('2d');
+    return dom.visualizerCanvas ? dom.visualizerCanvas.getContext('2d') : null;
 }

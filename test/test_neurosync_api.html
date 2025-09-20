@@ -4,83 +4,31 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Amara Bot</title>
-    <link rel="stylesheet" href="test_page.css">
+    <title>NeuroSync Forward Test</title>
+    <link rel="stylesheet" href="../test_page.css">
     <style>
-        #fileProtocolWarning {
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background-color: rgba(0, 0, 0, 0.8);
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            justify-content: center;
-            z-index: 9999;
-            color: white;
-            padding: 20px;
-            box-sizing: border-box;
+        #neuroSyncResult {
+            background: #111;
+            color: #0f0;
+            padding: 12px;
+            min-height: 120px;
+            border-radius: 6px;
+            overflow: auto;
+            white-space: pre-wrap;
         }
 
-        #fileProtocolWarning h2 {
-            color: #ff4d4d;
-            margin-bottom: 20px;
+        #neuroSyncStatus[data-level="error"] {
+            color: #e5534b;
         }
 
-        #fileProtocolWarning pre {
-            background-color: green;
-            font-size: 18px;
-            padding: 15px;
-            border-radius: 5px;
-            font-family: monospace;
-            overflow-x: auto;
-            margin: 15px 0;
+        #neuroSyncStatus[data-level="warning"] {
+            color: #f0ad4e;
         }
 
-        #fileProtocolWarning button {
-            background-color: #4CAF50;
-            color: white;
-            border: none;
-            padding: 10px 20px;
-            text-align: center;
-            text-decoration: none;
-            display: inline-block;
-            font-size: 16px;
-            margin: 10px 2px;
-            cursor: pointer;
-            border-radius: 4px;
-        }
-
-        #fileProtocolWarning button:hover {
-            background-color: #45a049;
+        #neuroSyncStatus[data-level="success"] {
+            color: #00c853;
         }
     </style>
-    <script>
-        // 检测是否使用file://协议打开
-        if (window.location.protocol === 'file:') {
-            document.addEventListener('DOMContentLoaded', function () {
-                // 创建警告框
-                const warningDiv = document.createElement('div');
-                warningDiv.id = 'fileProtocolWarning';
-                warningDiv.innerHTML = `
-                    <h2>⚠️ 警告：请使用HTTP服务器打开此页面</h2>
-                    <p>您当前使用的是本地文件方式打开页面（file://协议），这可能导致页面功能异常。</p>
-                    <p>您可以使用nginx映射启动测试页面，也可以请按照以下步骤使用python启动测试http服务：</p>
-                    <ol>
-                        <li>打开命令行终端</li>
-                        <li>命令行进入到 xiaozhi-server/test 目录</li>
-                        <li>执行以下命令启动HTTP服务器：</li>
-                    </ol>
-                    <pre>python -m http.server 8006</pre>
-                    <p>然后在浏览器中访问：<strong>http://localhost:8006/test_page.html</strong></p>
-                `;
-                document.body.appendChild(warningDiv);
-            });
-        }
-    </script>
-
     <script type="importmap">
         {
             "imports": {
@@ -93,13 +41,29 @@
 
 <body>
     <div class="container">
-        <h1>Amara Bot</h1>
+        <h1>NeuroSync Forward Test</h1>
 
-        <div id="scriptStatus" style="position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);">
-            Loading Opus Lib...
+        <div class="section">
+            <h2>NeuroSync API</h2>
+            <div class="config-panel" style="display: block; padding: 16px;">
+                <div class="config-item">
+                    <label for="neuroSyncApiUrl">API Endpoint:</label>
+                    <input type="text" id="neuroSyncApiUrl" placeholder="http://127.0.0.1:5000/audio_to_blendshapes">
+                </div>
+                <div class="config-item" style="margin-top: 12px;">
+                    <button id="neuroSyncCancel">Cancel Current Request</button>
+                </div>
+                <div class="config-item" style="margin-top: 12px;">
+                    <strong>Status:</strong>
+                    <span id="neuroSyncStatus" data-level="info">等待TTS语音流...</span>
+                </div>
+                <div class="config-item" style="margin-top: 12px;">
+                    <strong>Response:</strong>
+                    <pre id="neuroSyncResult">(等待返回结果)</pre>
+                </div>
+            </div>
         </div>
 
-        <!-- 添加配置面板 -->
         <div class="section">
             <h2>
                 Hardware Setting
@@ -196,10 +160,8 @@
         </div>
     </div>
 
-    <!-- Opus解码库 -->
-    <script src="libopus.js"></script>
-
-        <script type="module" src="./js/testPageMain.js"></script>
+    <script src="../libopus.js"></script>
+    <script type="module" src="../js/test/neuroSyncTestPage.js"></script>
 </body>
 
 </html>
