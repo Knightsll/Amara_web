@@ -1,19 +1,11 @@
 import { log } from '../utils/logger.js';
-import { initOpusDecoder } from '../app/audio.js';
+import { initOpusDecoder, registerPlaybackChunkListener } from '../app/audio.js';
+import { state } from '../app/state.js';
+import { SAMPLE_RATE, CHANNELS, MIN_AUDIO_DURATION } from '../app/constants.js';
 
-const SAMPLE_RATE = 16000;
-const CHANNELS = 1;
-
-function mergePcmChunks(chunks) {
-    const totalLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
-    const merged = new Int16Array(totalLength);
-    let offset = 0;
-    chunks.forEach(chunk => {
-        merged.set(chunk, offset);
-        offset += chunk.length;
-    });
-    return merged;
-}
+const FRAME_SIZE = 960;
+const FRAME_SIZE_BYTES = FRAME_SIZE * CHANNELS * 2;
+const CHUNK_SAMPLES = Math.max(1, Math.round(SAMPLE_RATE * MIN_AUDIO_DURATION * 3));
 
 function encodeWav(int16Samples, sampleRate, channels) {
     const bytesPerSample = 2;
@@ -22,7 +14,6 @@ function encodeWav(int16Samples, sampleRate, channels) {
     const dataSize = int16Samples.length * bytesPerSample;
     const buffer = new ArrayBuffer(44 + dataSize);
     const view = new DataView(buffer);
-
     let offset = 0;
 
     const writeString = (str) => {
@@ -36,12 +27,12 @@ function encodeWav(int16Samples, sampleRate, channels) {
     writeString('WAVE');
     writeString('fmt ');
     view.setUint32(offset, 16, true); offset += 4;
-    view.setUint16(offset, 1, true); offset += 2; // PCM
+    view.setUint16(offset, 1, true); offset += 2;
     view.setUint16(offset, channels, true); offset += 2;
     view.setUint32(offset, sampleRate, true); offset += 4;
     view.setUint32(offset, byteRate, true); offset += 4;
     view.setUint16(offset, blockAlign, true); offset += 2;
-    view.setUint16(offset, 16, true); offset += 2; // bits per sample
+    view.setUint16(offset, 16, true); offset += 2;
     writeString('data');
     view.setUint32(offset, dataSize, true); offset += 4;
 
@@ -107,8 +98,34 @@ async function createStandaloneOpusDecoder() {
     };
 }
 
-const FRAME_SIZE = 960;
-const FRAME_SIZE_BYTES = FRAME_SIZE * CHANNELS * 2;
+function extractBlendshapeFrames(response, fallbackDuration) {
+    if (!response) return [];
+    let frames = [];
+    if (Array.isArray(response)) {
+        frames = response;
+    } else if (Array.isArray(response.frames)) {
+        frames = response.frames;
+    } else if (Array.isArray(response.blendshapes)) {
+        frames = response.blendshapes;
+    } else if (response.values && typeof response.values === 'object') {
+        frames = [{ time: 0, values: response.values }];
+    } else {
+        frames = [{ time: 0, values: response }];
+    }
+
+    const duration = Math.max(fallbackDuration, 0.0001);
+    if (!frames.length) return [];
+
+    return frames.map((frame, index) => {
+        const time = typeof frame.time === 'number'
+            ? Math.max(0, Math.min(duration, frame.time))
+            : (duration / Math.max(frames.length, 1)) * index;
+        const values = frame.values && typeof frame.values === 'object'
+            ? frame.values
+            : frame;
+        return { time, values };
+    });
+}
 
 export function initNeuroSyncForwarder({
     apiUrlInput,
@@ -116,8 +133,12 @@ export function initNeuroSyncForwarder({
     resultElement
 }) {
     let collecting = false;
-    let pcmChunks = [];
+    let pcmAccumulator = new Int16Array(0);
     let decoderPromise = null;
+    let chunkSequence = 0;
+    let postQueue = Promise.resolve();
+    const chunkStates = new Map(); // index -> { promise, resolve, data }
+    const scheduledTimers = new Set();
     let lastPostAbort = null;
 
     function updateStatus(text, level = 'info') {
@@ -138,6 +159,18 @@ export function initNeuroSyncForwarder({
         return decoderPromise;
     }
 
+    function resetSession() {
+        scheduledTimers.forEach(timer => clearTimeout(timer));
+        scheduledTimers.clear();
+        pcmAccumulator = new Int16Array(0);
+        chunkSequence = 0;
+        postQueue = Promise.resolve();
+        chunkStates.clear();
+        if (resultElement) {
+            resultElement.textContent = '(等待返回结果)';
+        }
+    }
+
     async function consumeBinaryFrame(data) {
         if (!collecting) return;
         try {
@@ -147,28 +180,63 @@ export function initNeuroSyncForwarder({
             if (!opusData.length) return;
             const decoder = await ensureDecoder();
             const pcm = decoder.decode(opusData);
-            if (pcm.length) {
-                pcmChunks.push(pcm);
+            if (!pcm.length) return;
+
+            const merged = new Int16Array(pcmAccumulator.length + pcm.length);
+            merged.set(pcmAccumulator, 0);
+            merged.set(pcm, pcmAccumulator.length);
+            pcmAccumulator = merged;
+
+            while (pcmAccumulator.length >= CHUNK_SAMPLES) {
+                const chunk = pcmAccumulator.slice(0, CHUNK_SAMPLES);
+                pcmAccumulator = pcmAccumulator.slice(CHUNK_SAMPLES);
+                enqueueChunk(chunk);
             }
         } catch (error) {
             updateStatus(`解码音频帧失败: ${error.message}`, 'error');
         }
     }
 
-    function resetCollection() {
-        pcmChunks = [];
+    function enqueueChunk(int16Samples, { finalChunk = false } = {}) {
+        const index = chunkSequence++;
+        let resolveBlendshape;
+        let rejectBlendshape;
+        const blendshapePromise = new Promise((resolve, reject) => {
+            resolveBlendshape = resolve;
+            rejectBlendshape = reject;
+        });
+
+        const chunkState = {
+            index,
+            promise: blendshapePromise,
+            resolve: resolveBlendshape,
+            reject: rejectBlendshape,
+            blendshape: null,
+            duration: int16Samples.length / SAMPLE_RATE,
+            finalChunk
+        };
+        chunkStates.set(index, chunkState);
+
+        postQueue = postQueue.then(() => postChunkToApi(int16Samples, index))
+            .then(response => {
+                chunkState.blendshape = response;
+                chunkState.resolve(response);
+            })
+            .catch(error => {
+                updateStatus(`NeuroSync 请求失败 (chunk ${index}): ${error.message}`, 'error');
+                chunkState.resolve(null); // 允许音频继续播放
+            });
     }
 
-    async function postToApi(int16Samples) {
+    async function postChunkToApi(int16Samples, index) {
         const apiUrl = apiUrlInput ? apiUrlInput.value.trim() : '';
         if (!apiUrl) {
-            updateStatus('NeuroSync API 地址为空，跳过上传', 'warning');
-            return;
+            throw new Error('NeuroSync API 地址为空');
         }
-        updateStatus('正在发送音频到NeuroSync API...', 'info');
         const wavBytes = encodeWav(int16Samples, SAMPLE_RATE, CHANNELS);
         const controller = new AbortController();
         lastPostAbort = controller;
+        updateStatus(`发送第 ${index + 1} 个音频块到 NeuroSync...`, 'info');
         try {
             const response = await fetch(apiUrl, {
                 method: 'POST',
@@ -180,23 +248,14 @@ export function initNeuroSyncForwarder({
             });
             if (!response.ok) {
                 const text = await response.text();
-                updateStatus(`NeuroSync 请求失败: ${response.status} ${text}`, 'error');
-                if (resultElement) {
-                    resultElement.textContent = text;
-                }
-                return;
+                throw new Error(`${response.status} ${text}`);
             }
             const json = await response.json().catch(() => null);
-            updateStatus('NeuroSync 响应成功', 'success');
             if (resultElement) {
                 resultElement.textContent = JSON.stringify(json ?? {}, null, 2);
             }
-        } catch (error) {
-            if (error.name === 'AbortError') {
-                updateStatus('NeuroSync 请求已取消', 'warning');
-            } else {
-                updateStatus(`NeuroSync 请求异常: ${error.message}`, 'error');
-            }
+            updateStatus(`NeuroSync 块 ${index + 1} 响应成功`, 'success');
+            return json;
         } finally {
             if (lastPostAbort === controller) {
                 lastPostAbort = null;
@@ -204,30 +263,53 @@ export function initNeuroSyncForwarder({
         }
     }
 
-    async function finalizeUpload() {
-        if (!pcmChunks.length) {
-            updateStatus('未收集到任何PCM数据，跳过上传', 'warning');
-            return;
-        }
-        const merged = mergePcmChunks(pcmChunks);
-        resetCollection();
-        await postToApi(merged);
-    }
-
     function handleServerMessage(message) {
         if (!message || message.type !== 'tts') return;
         if (message.state === 'start') {
             collecting = true;
-            resetCollection();
+            resetSession();
             updateStatus('开始收集小智语音流...', 'info');
         } else if (message.state === 'stop') {
             collecting = false;
-            updateStatus('语音流结束，准备发送到NeuroSync', 'info');
-            finalizeUpload().catch(error => {
-                updateStatus(`上传NeuroSync失败: ${error.message}`, 'error');
-            });
+            if (pcmAccumulator.length) {
+                enqueueChunk(pcmAccumulator.slice(), { finalChunk: true });
+                pcmAccumulator = new Int16Array(0);
+            }
         }
     }
+
+    registerPlaybackChunkListener((chunkInfo) => {
+        const chunkState = chunkStates.get(chunkInfo.index);
+        if (!chunkState) {
+            return null;
+        }
+        return {
+            beforePlay: chunkState.promise,
+            onStart: ({ startTime, audioContext }) => {
+                if (!chunkState.blendshape) return;
+                const viewer = state.blendshapeViewer;
+                if (!viewer || typeof viewer.applyBlendshapeFrame !== 'function') return;
+                const frames = extractBlendshapeFrames(chunkState.blendshape, chunkState.duration);
+                frames.forEach(frame => {
+                    const delay = Math.max(0, frame.time);
+                    const targetTime = startTime + delay;
+                    const msDelay = Math.max(0, (targetTime - audioContext.currentTime) * 1000);
+                    const timerId = setTimeout(() => {
+                        scheduledTimers.delete(timerId);
+                        try {
+                            viewer.applyBlendshapeFrame(frame.values);
+                        } catch (error) {
+                            log(`应用NeuroSync表情帧失败: ${error.message}`, 'warning');
+                        }
+                    }, msDelay);
+                    scheduledTimers.add(timerId);
+                });
+            },
+            onEnd: () => {
+                chunkStates.delete(chunkInfo.index);
+            }
+        };
+    });
 
     window.addEventListener('beforeunload', () => {
         if (lastPostAbort) {
@@ -243,6 +325,8 @@ export function initNeuroSyncForwarder({
             if (lastPostAbort) {
                 lastPostAbort.abort();
             }
+            scheduledTimers.forEach(timer => clearTimeout(timer));
+            scheduledTimers.clear();
         }
     };
 }

@@ -11,6 +11,7 @@ export class StreamingContext {
         this.sampleRate = sampleRate;
         this.channels = channels;
         this.minAudioDuration = minAudioDuration;
+        this.chunkSamples = Math.max(1, Math.round(this.sampleRate * this.minAudioDuration * 3));
 
         // 初始化队列和状态
         this.queue = [];          // 已解码的PCM队列。正在播放
@@ -22,11 +23,19 @@ export class StreamingContext {
         this.source = null;       // 当前音频源
         this.totalSamples = 0;    // 累积的总样本数
         this.lastPlayTime = 0;    // 上次播放的时间戳
+        this.playbackChunkIndex = 0;
+        this.chunkListeners = [];
     }
 
     // 缓存音频数组
     pushAudioBuffer(item) {
         this.audioBufferQueue.enqueue(...item);
+    }
+
+    registerChunkListener(listener) {
+        if (typeof listener === 'function') {
+            this.chunkListeners.push(listener);
+        }
     }
 
     // 获取需要处理缓存队列，单线程：在audioBufferQueue一直更新的状态下不会出现安全问题
@@ -105,38 +114,102 @@ export class StreamingContext {
             }
             this.playing = true;
             while (this.playing && this.queue.length) {
-                // 创建新的音频缓冲区
-                const minPlaySamples = Math.min(this.queue.length, this.sampleRate);
-                const currentSamples = this.queue.splice(0, minPlaySamples);
-
-                const audioBuffer = this.audioContext.createBuffer(this.channels, currentSamples.length, this.sampleRate);
-                audioBuffer.copyToChannel(new Float32Array(currentSamples), 0);
-
-                // 创建音频源
-                this.source = this.audioContext.createBufferSource();
-                this.source.buffer = audioBuffer;
-
-                // 创建增益节点用于平滑过渡
-                const gainNode = this.audioContext.createGain();
-
-                // 应用淡入淡出效果避免爆音
-                const fadeDuration = 0.02; // 20毫秒
-                gainNode.gain.setValueAtTime(0, this.audioContext.currentTime);
-                gainNode.gain.linearRampToValueAtTime(1, this.audioContext.currentTime + fadeDuration);
-
-                const duration = audioBuffer.duration;
-                if (duration > fadeDuration * 2) {
-                    gainNode.gain.setValueAtTime(1, this.audioContext.currentTime + duration - fadeDuration);
-                    gainNode.gain.linearRampToValueAtTime(0, this.audioContext.currentTime + duration);
+                const hasEnoughSamples = this.queue.length >= this.chunkSamples;
+                if (!hasEnoughSamples && !this.endOfStream) {
+                    break;
                 }
 
-                // 连接节点并开始播放
-                this.source.connect(gainNode);
+                const chunkLength = hasEnoughSamples ? this.chunkSamples : this.queue.length;
+                if (!chunkLength) {
+                    break;
+                }
+
+                const currentSamples = this.queue.splice(0, chunkLength);
+                const floatSamples = new Float32Array(currentSamples);
+                const chunkIndex = this.playbackChunkIndex++;
+                const chunkDuration = floatSamples.length / this.sampleRate;
+                const chunkInfo = {
+                    index: chunkIndex,
+                    duration: chunkDuration,
+                    sampleRate: this.sampleRate,
+                    samples: floatSamples
+                };
+
+                let hooks = [];
+                if (this.chunkListeners.length) {
+                    hooks = this.chunkListeners.map(listener => {
+                        try {
+                            return listener(chunkInfo) || null;
+                        } catch (error) {
+                            log(`播放块监听器执行失败: ${error.message}`, 'warning');
+                            return null;
+                        }
+                    }).filter(Boolean);
+                    const beforePlayPromises = hooks
+                        .map(hook => hook.beforePlay)
+                        .filter(Boolean);
+                    if (beforePlayPromises.length) {
+                        try {
+                            await Promise.all(beforePlayPromises);
+                        } catch (error) {
+                            log(`等待播放块前置任务失败: ${error.message}`, 'error');
+                        }
+                    }
+                }
+
+                const audioBuffer = this.audioContext.createBuffer(this.channels, floatSamples.length, this.sampleRate);
+                audioBuffer.copyToChannel(floatSamples, 0);
+
+                const source = this.audioContext.createBufferSource();
+                source.buffer = audioBuffer;
+                const gainNode = this.audioContext.createGain();
+
+                const fadeDuration = 0.02;
+                const now = this.audioContext.currentTime;
+                gainNode.gain.setValueAtTime(0, now);
+                gainNode.gain.linearRampToValueAtTime(1, now + fadeDuration);
+
+                if (chunkDuration > fadeDuration * 2) {
+                    gainNode.gain.setValueAtTime(1, now + chunkDuration - fadeDuration);
+                    gainNode.gain.linearRampToValueAtTime(0, now + chunkDuration);
+                }
+
+                source.connect(gainNode);
                 gainNode.connect(this.audioContext.destination);
 
-                this.lastPlayTime = this.audioContext.currentTime;
-                log(`开始播放 ${currentSamples.length} 个样本，约 ${(currentSamples.length / this.sampleRate).toFixed(2)} 秒`, 'info');
-                this.source.start();
+                const playbackInfo = {
+                    chunk: chunkInfo,
+                    duration: chunkDuration,
+                    audioContext: this.audioContext,
+                    startTime: this.audioContext.currentTime
+                };
+
+                source.onended = () => {
+                    hooks.forEach(hook => {
+                        if (typeof hook.onEnd === 'function') {
+                            try {
+                                hook.onEnd(playbackInfo);
+                            } catch (error) {
+                                log(`播放块结束回调错误: ${error.message}`, 'warning');
+                            }
+                        }
+                    });
+                };
+
+                hooks.forEach(hook => {
+                    if (typeof hook.onStart === 'function') {
+                        try {
+                            hook.onStart(playbackInfo);
+                        } catch (error) {
+                            log(`播放块开始回调错误: ${error.message}`, 'warning');
+                        }
+                    }
+                });
+
+                this.source = source;
+                this.lastPlayTime = now;
+                log(`开始播放第 ${chunkIndex} 个块，样本 ${floatSamples.length} (~${chunkDuration.toFixed(2)} 秒)`, 'info');
+                source.start();
             }
             await this.getQueue(minSamples);
         }

@@ -13,7 +13,7 @@ export function initApp() {
     configureAudio();
     initializeWebsocketModule();
 
-    setupBlendshapeViewer({
+    const viewer = setupBlendshapeViewer({
         modelFileInput: dom.modelFileInput,
         unloadModelButton: dom.unloadModelButton,
         modelViewer: dom.modelViewer,
@@ -22,6 +22,8 @@ export function initApp() {
         streamStatus: dom.streamStatus,
         log
     });
+
+    state.blendshapeViewer = viewer;
 
     initUI({
         onConnect: connectToServer,

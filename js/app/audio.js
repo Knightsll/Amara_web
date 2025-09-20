@@ -7,9 +7,19 @@ import { SAMPLE_RATE, CHANNELS, FRAME_SIZE, MIN_AUDIO_DURATION } from './constan
 
 let visualizerContext = getVisualizerContext();
 let sendCommandToBridge = () => {};
+const pendingChunkListeners = [];
 
 export function configureAudio({ sendCommand } = {}) {
     sendCommandToBridge = typeof sendCommand === 'function' ? sendCommand : () => {};
+}
+
+export function registerPlaybackChunkListener(listener) {
+    if (typeof listener !== 'function') return;
+    if (state.streamingContext && typeof state.streamingContext.registerChunkListener === 'function') {
+        state.streamingContext.registerChunkListener(listener);
+    } else {
+        pendingChunkListeners.push(listener);
+    }
 }
 
 export function getAudioContextInstance() {
@@ -486,6 +496,10 @@ export async function playBufferedAudio() {
                 CHANNELS,
                 MIN_AUDIO_DURATION
             );
+            while (pendingChunkListeners.length) {
+                const listener = pendingChunkListeners.shift();
+                state.streamingContext.registerChunkListener(listener);
+            }
         }
         state.streamingContext.decodeOpusFrames();
         state.streamingContext.startPlaying();

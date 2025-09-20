@@ -17,6 +17,7 @@ export const state = {
     audioBufferQueue: [],
     isAudioPlaying: false,
     streamingContext: null,
+    blendshapeViewer: null,
     audioProcessor: null,
     audioProcessorType: null,
     audioSource: null,
