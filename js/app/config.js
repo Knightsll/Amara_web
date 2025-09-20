@@ -56,6 +56,23 @@ export function initConfigBindings() {
         }
     }
 
+    if (dom.armApiInput) {
+        const savedArmUrl = localStorage.getItem('armApiUrl');
+        if (savedArmUrl) {
+            dom.armApiInput.value = savedArmUrl;
+        } else if (!dom.armApiInput.value) {
+            dom.armApiInput.value = 'http://127.0.0.1:5123';
+        }
+        const persistArmUrl = () => {
+            const value = dom.armApiInput.value.trim();
+            if (value) {
+                localStorage.setItem('armApiUrl', value);
+            }
+        };
+        dom.armApiInput.addEventListener('change', persistArmUrl);
+        dom.armApiInput.addEventListener('blur', persistArmUrl);
+    }
+
     if (dom.toggleConfig && dom.configPanel) {
         dom.toggleConfig.addEventListener('click', () => {
             const isExpanded = dom.configPanel.classList.contains('expanded');

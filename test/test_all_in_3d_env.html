@@ -64,6 +64,7 @@
             color: #f5f6ff;
             outline: none;
             transition: border 0.2s ease, box-shadow 0.2s ease;
+            width: 100%;
         }
 
         input:focus,
@@ -532,6 +533,7 @@
                 </div>
                 <button id="toggleConfig" style="min-width: 72px;">Edit</button>
             </div>
+            <input type="text" id="armApiUrl" placeholder="Arm Flask 地址，例如 http://127.0.0.1:5123" />
             <div id="configPanel" class="config-panel">
                 <div class="config-grid">
                     <label>Device MAC

@@ -22,6 +22,7 @@ export const dom = {
     deviceNameInput: document.getElementById('deviceName'),
     clientIdInput: document.getElementById('clientId'),
     tokenInput: document.getElementById('token'),
+    armApiInput: document.getElementById('armApiUrl'),
     displayMac: document.getElementById('displayMac'),
     displayClient: document.getElementById('displayClient'),
     toggleConfig: document.getElementById('toggleConfig'),

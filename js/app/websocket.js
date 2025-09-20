@@ -10,6 +10,65 @@ let sendCommandToBridge = () => {};
 const serverMessageListeners = new Set();
 const binaryMessageListeners = new Set();
 
+const ARM_ENDPOINTS = {
+    say_hello: '/amara/say_hello',
+    cheerful: '/amara/cheerful',
+    talk: '/amara/talk',
+    stop: '/amara/stop'
+};
+
+const ARM_MATCHERS = {
+    say_hello: ['hello', 'hi', 'new friend'],
+    cheerful: ['cheer', 'depressed']
+};
+
+function getArmBaseUrl() {
+    const input = dom.armApiInput;
+    if (!input) return '';
+    return input.value.trim();
+}
+
+function buildArmUrl(action) {
+    const base = getArmBaseUrl();
+    if (!base) return '';
+    const endpoint = ARM_ENDPOINTS[action];
+    if (!endpoint) return '';
+    const sanitized = base.endsWith('/') ? base.slice(0, -1) : base;
+    return `${sanitized}${endpoint}`;
+}
+
+async function triggerArmAction(action, { reason } = {}) {
+    const url = buildArmUrl(action);
+    if (!url) {
+        log(`[Arm] 未配置地址，跳过动作 ${action}`, 'warning');
+        return;
+    }
+    try {
+        const response = await fetch(url, { method: 'POST' });
+        if (!response.ok) {
+            throw new Error(`${response.status} ${response.statusText}`);
+        }
+        const context = reason ? ` (reason: ${reason})` : '';
+        log(`[Arm] 动作 ${action} 已触发${context}`, 'info');
+    } catch (error) {
+        log(`[Arm] 调用 ${action} 失败: ${error.message}`, 'error');
+    }
+}
+
+function handleArmIntentByText(rawText) {
+    if (!rawText) return;
+    const text = rawText.toLowerCase();
+    if (ARM_MATCHERS.say_hello.some(keyword => text.includes(keyword))) {
+        triggerArmAction('say_hello', { reason: rawText });
+        return;
+    }
+    if (ARM_MATCHERS.cheerful.some(keyword => text.includes(keyword))) {
+        triggerArmAction('cheerful', { reason: rawText });
+        return;
+    }
+    triggerArmAction('talk', { reason: rawText });
+}
+
 export function initializeWebsocketModule({ sendCommand } = {}) {
     sendCommandToBridge = typeof sendCommand === 'function' ? sendCommand : () => {};
 }
@@ -129,6 +188,7 @@ export function sendTextMessage() {
     if (!message || !state.websocket || state.websocket.readyState !== WebSocket.OPEN) return;
 
     try {
+        handleArmIntentByText(message);
         const listenMessage = {
             type: 'listen',
             mode: 'manual',
@@ -311,6 +371,7 @@ export function handleServerMessage(message) {
                 dom.recordButton.textContent = '开始录音';
                 dom.recordButton.classList.remove('recording');
             }
+            triggerArmAction('stop', { reason: 'tts_stop' });
         }
         return;
     }
@@ -323,6 +384,21 @@ export function handleServerMessage(message) {
     if (type === 'stt') {
         log(`识别结果: ${message.text}`, 'info');
         addMessage(`[语音识别] ${message.text}`, true);
+        if (message && message.text) {
+            let isFinal = true;
+            if (Object.prototype.hasOwnProperty.call(message, 'final')) {
+                isFinal = !!message.final;
+            } else if (Object.prototype.hasOwnProperty.call(message, 'is_final')) {
+                isFinal = !!message.is_final;
+            }
+            const sttState = typeof message.state === 'string' ? message.state.toLowerCase() : '';
+            if (['partial', 'detect', 'listening', 'processing', 'intermediate'].includes(sttState)) {
+                isFinal = false;
+            }
+            if (isFinal) {
+                handleArmIntentByText(message.text);
+            }
+        }
         return;
     }
 
