@@ -155,6 +155,30 @@ function valuesToObject(valuesArray) {
     return result;
 }
 
+function summarizeBlendshapeValues(obj) {
+    if (!obj || typeof obj !== 'object') {
+        return { keyCount: 0, nonZeroCount: 0, sample: [] };
+    }
+    const keys = Object.keys(obj);
+    const nonZero = [];
+    for (const key of keys) {
+        const num = Number(obj[key]);
+        if (Number.isFinite(num) && num !== 0) {
+            nonZero.push({ key, value: num });
+            if (nonZero.length >= 5) break;
+        }
+    }
+    const nonZeroCount = keys.reduce((count, key) => {
+        const num = Number(obj[key]);
+        return count + (Number.isFinite(num) && num !== 0 ? 1 : 0);
+    }, 0);
+    return {
+        keyCount: keys.length,
+        nonZeroCount,
+        sample: nonZero.map(({ key, value }) => ({ key, value: Number(value.toFixed(3)) }))
+    };
+}
+
 function applyUnityValue(targetArray, unityName, value) {
     const index = UNITY_INDEX.get(unityName);
     if (index === undefined) return;
@@ -184,7 +208,7 @@ function processTopEmotionsFromArray(nsArray, mapped, { decay, alpha }) {
     scaled.sort((a, b) => b.value - a.value);
     const top = scaled.slice(0, 2);
 
-    console.debug('Top emotions (array):', top);
+    // console.log('Top emotions (array):', top);
 
     EMOTION_TO_UNITY_MAP.forEach((unityNames) => {
         unityNames.forEach(unityName => {
@@ -224,7 +248,7 @@ function processTopEmotionsFromObject(emotions, mapped, { decay, alpha }) {
     scaled.sort((a, b) => b.value - a.value);
     const top = scaled.slice(0, 2);
 
-    console.debug('Top emotions (object):', top);
+    // console.log('Top emotions (object):', top);
 
     EMOTION_TO_UNITY_MAP.forEach((unityNames) => {
         unityNames.forEach(unityName => {
@@ -261,7 +285,13 @@ function mapArrayValues(nsArray, { decay = DEFAULT_DECAY, alpha = DEFAULT_ALPHA 
     processTopEmotionsFromArray(nsArray, mapped, { decay, alpha });
 
     lastValues.set(mapped);
-    return valuesToObject(mapped);
+    const result = valuesToObject(mapped);
+    // console.log('[NeuroSync] mapArrayValues summary', {
+    //     inputLength: Array.isArray(nsArray) ? nsArray.length : 0,
+    //     nonZeroInput: Array.isArray(nsArray) ? nsArray.some(v => Number(v) !== 0) : false,
+    //     output: summarizeBlendshapeValues(result)
+    // });
+    return result;
 }
 
 function mapObjectValues(valueObject, options = {}) {
@@ -295,7 +325,12 @@ function mapObjectValues(valueObject, options = {}) {
         lastValues.set(mapped);
     }
 
-    return valuesToObject(mapped);
+    const result = valuesToObject(mapped);
+    // console.log('[NeuroSync] mapObjectValues summary', {
+    //     changed,
+    //     output: summarizeBlendshapeValues(result)
+    // });
+    return result;
 }
 
 // -------- 其他保持不变 --------
@@ -392,6 +427,24 @@ export function parseNeuroSyncBlendshapeFrames(
     preExtractedFrames = null
 ) {
     const rawFrames = preExtractedFrames ?? extractRawNeuroSyncFrames(response, { duration });
+    const rawFramesSummary = rawFrames.map(frame => {
+        const arrayValues = Array.isArray(frame.arrayValues) ? frame.arrayValues : null;
+        const namedValues = frame.values && typeof frame.values === 'object' ? frame.values : {};
+        const nonZeroArray = arrayValues ? arrayValues.some(value => Number(value) !== 0) : null;
+        const valueKeys = Object.keys(namedValues);
+        const nonZeroObject = valueKeys.some(key => Number(namedValues[key]) !== 0);
+        return {
+            time: frame?.time ?? 0,
+            arrayLength: arrayValues?.length ?? 0,
+            hasNonZeroArray: !!nonZeroArray,
+            valueKeyCount: valueKeys.length,
+            hasNonZeroObject: nonZeroObject
+        };
+    });
+    // console.log('[NeuroSync] raw frames summary', rawFramesSummary);
+    // if (rawFrames.length) {
+    //     console.log('[NeuroSync] first raw frame data', rawFrames[0]);
+    // }
     if (!rawFrames.length) return [];
 
     // 修复第一个 frame 全 0
@@ -417,6 +470,55 @@ export function parseNeuroSyncBlendshapeFrames(
 
     if (enableBlink) {
         frames = applyBlink(frames);
+        /*
+        const preBlinkFrames = frames.map(frame => ({ time: frame.time, values: { ...frame.values } }));
+        const framesBlinkSummary = frames.slice(0, 5).map(({ time, values }) => ({
+            time,
+            eyeBlinkLeft: Number(toNumber(values.eyeBlinkLeft ?? values.EyeBlinkLeft).toFixed(3)),
+            eyeBlinkRight: Number(toNumber(values.eyeBlinkRight ?? values.EyeBlinkRight).toFixed(3))
+        }));
+        const nonBlinkDiagnostics = frames.slice(0, 5).map((afterFrame, index) => {
+            const beforeFrame = preBlinkFrames[index];
+            if (!afterFrame || !beforeFrame) return null;
+            const beforeValues = beforeFrame.values || {};
+            const afterValues = afterFrame.values || {};
+            const mergedKeys = new Set([...Object.keys(beforeValues), ...Object.keys(afterValues)]);
+            let beforeNonZero = 0;
+            let afterNonZero = 0;
+            const zeroedKeys = [];
+            const changedKeys = [];
+            mergedKeys.forEach(key => {
+                if (!key || key.toLowerCase().includes('blink')) return;
+                const beforeVal = toNumber(beforeValues[key]);
+                const afterVal = toNumber(afterValues[key]);
+                if (Math.abs(beforeVal) > 1e-6) beforeNonZero += 1;
+                if (Math.abs(afterVal) > 1e-6) afterNonZero += 1;
+                if (Math.abs(afterVal - beforeVal) > 1e-6) {
+                    const entry = {
+                        key,
+                        before: Number(beforeVal.toFixed(3)),
+                        after: Number(afterVal.toFixed(3))
+                    };
+                    changedKeys.push(entry);
+                    if (Math.abs(beforeVal) > 1e-6 && Math.abs(afterVal) <= 1e-6) {
+                        zeroedKeys.push(entry);
+                    }
+                }
+            });
+            return {
+                time: afterFrame.time,
+                beforeNonZero,
+                afterNonZero,
+                zeroedKeys: zeroedKeys.slice(0, 5),
+                changedKeys: changedKeys.slice(0, 5)
+            };
+        }).filter(Boolean);
+        console.log('[NeuroSync] frames after blink', {
+            frameCount: frames.length,
+            blinkSample: framesBlinkSummary,
+            nonBlinkDiagnostics
+        });
+        */
     }
 
     return frames;

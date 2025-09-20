@@ -169,11 +169,18 @@ export class StreamingContext {
                         .map(hook => hook.beforePlay)
                         .filter(Boolean);
                     if (beforePlayPromises.length) {
+                        let beforePlayResult;
                         try {
-                            await Promise.all(beforePlayPromises);
+                            log(`[StreamingContext] waiting beforePlay hooks (chunk ${chunkIndex}, hooks ${beforePlayPromises.length})`, 'debug');
+                            beforePlayResult = await Promise.all(beforePlayPromises);
+                            log(`[StreamingContext] beforePlay resolved (chunk ${chunkIndex})`, 'debug');
                         } catch (error) {
-                            log(`等待播放块前置任务失败: ${error.message}`, 'error');
+                            log(`[StreamingContext] beforePlay rejected (chunk ${chunkIndex}): ${error.message}`, 'error');
                         }
+                        hooks.forEach((hook, idx) => {
+                            if (!hook || typeof hook.onBeforePlayResult !== 'function') return;
+                            hook.onBeforePlayResult(beforePlayResult?.[idx]);
+                        });
                     }
                 }
 
@@ -223,6 +230,8 @@ export class StreamingContext {
                         } catch (error) {
                             log(`播放块开始回调错误: ${error.message}`, 'warning');
                         }
+                    } else {
+                        log(`[StreamingContext] hook missing onStart for chunk ${chunkIndex}`, 'debug');
                     }
                 });
 

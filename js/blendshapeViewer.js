@@ -280,6 +280,24 @@ export class BlendshapeViewer {
         });
     }
 
+    debugSummarizeValues(values) {
+        if (!values || typeof values !== 'object') {
+            return { nonZeroCount: 0, sample: [] };
+        }
+        let nonZeroCount = 0;
+        const sample = [];
+        Object.entries(values).forEach(([key, value]) => {
+            const numeric = Number(value) || 0;
+            if (Math.abs(numeric) > 1e-6) {
+                nonZeroCount += 1;
+                if (!key.toLowerCase().includes('blink') && sample.length < 5) {
+                    sample.push({ key, value: Number(numeric.toFixed(3)) });
+                }
+            }
+        });
+        return { nonZeroCount, sample };
+    }
+
     setBlendshapeValue(name, value) {
         const canonical = this.resolveBlendshapeName(name);
         if (!canonical) return;
@@ -301,9 +319,29 @@ export class BlendshapeViewer {
             return;
         }
 
+        const inputSummary = this.debugSummarizeValues(frame);
+        const missingKeys = [];
+
         Object.entries(frame).forEach(([name, value]) => {
+            const canonical = this.resolveBlendshapeName(name);
+            if (!canonical) {
+                missingKeys.push(name);
+                return;
+            }
             const clampedValue = Math.max(0, Math.min(1, Number(value)));
-            this.setBlendshapeValue(name, clampedValue);
+            this.setBlendshapeValue(canonical, clampedValue);
+        });
+
+        const stateObject = {};
+        this.currentBlendshapeValues.forEach((value, key) => {
+            stateObject[key] = value;
+        });
+        const stateSummary = this.debugSummarizeValues(stateObject);
+
+        console.log('[NeuroSync] viewer apply summary', {
+            input: inputSummary,
+            state: stateSummary,
+            missingKeys: missingKeys.slice(0, 5)
         });
 
         this.updateStreamStatus(`frame applied @ ${new Date().toLocaleTimeString()}`);

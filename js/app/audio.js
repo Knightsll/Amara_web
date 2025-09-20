@@ -193,14 +193,20 @@ export async function startDirectRecording() {
             return false;
         }
 
-        const stream = await navigator.mediaDevices.getUserMedia({
-            audio: {
-                echoCancellation: true,
-                noiseSuppression: true,
-                sampleRate: SAMPLE_RATE,
-                channelCount: CHANNELS
+        const stream = await (async () => {
+            if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                throw new Error('当前环境不支持 getUserMedia，请在 HTTPS/localhost 上运行，并使用现代浏览器');
             }
-        });
+            return await navigator.mediaDevices.getUserMedia({
+                audio: {
+                    echoCancellation: true,
+                    noiseSuppression: true,
+                    sampleRate: SAMPLE_RATE,
+                    channelCount: CHANNELS
+                }
+            });
+        })();
+        
 
         state.audioContext = getAudioContextInstance();
         const processorResult = await createAudioProcessor();

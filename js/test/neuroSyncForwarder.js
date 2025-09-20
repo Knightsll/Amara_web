@@ -218,17 +218,9 @@ export function initNeuroSyncForwarder({
             .then(response => {
                 const parsed = Array.isArray(response?.blendshapes) ? response.blendshapes : response;
                 const rawFrames = extractRawNeuroSyncFrames(parsed, { duration: chunkState.duration });
-                const rawArraySample = rawFrames[0]?.arrayValues ? Array.from(rawFrames[0].arrayValues).slice(0, 10) : null;
-                if (rawArraySample) {
-                    console.log('[NeuroSync] raw chunk', index + 1, rawArraySample.map(v => Number(v).toFixed(4)).join(', '));
-                } else if (rawFrames[0]?.values) {
-                    const sampleEntries = Object.entries(rawFrames[0].values).slice(0, 10);
-                    console.log('[NeuroSync] raw chunk', index + 1, sampleEntries.map(([k, v]) => `${k}:${Number(v).toFixed(4)}`).join(', '));
-                }
                 const frames = parseNeuroSyncBlendshapeFrames(parsed, { duration: chunkState.duration }, rawFrames);
                 chunkState.blendshape = frames;
                 chunkState.resolve(frames);
-                console.log('[NeuroSync] chunk', index + 1, 'resolved frames:', frames?.length ?? 0, 'session:', chunkState.session, 'current:', currentSessionId);
                 appendBlendshapeLogs(index + 1, rawFrames, chunkState.duration);
                 scheduleChunkFrames(chunkState);
             })
@@ -241,23 +233,115 @@ export function initNeuroSyncForwarder({
             });
     }
 
+    function summarizeFrameValues(values) {
+        if (!values || typeof values !== 'object') {
+            return { nonZeroCount: 0, sample: [] };
+        }
+        let nonZeroCount = 0;
+        const sample = [];
+        Object.entries(values).forEach(([key, value]) => {
+            const numeric = Number(value) || 0;
+            if (Math.abs(numeric) > 1e-6) {
+                nonZeroCount += 1;
+                if (!key.toLowerCase().includes('blink') && sample.length < 5) {
+                    sample.push({ key, value: Number(numeric.toFixed(3)) });
+                }
+            }
+        });
+        return { nonZeroCount, sample };
+    }
+
     function scheduleChunkFrames(chunkState) {
-        if (chunkState.scheduled) return;
-        if (!chunkState.startInfo) return;
-        if (chunkState.session !== currentSessionId) return;
+        const hasStartInfo = !!chunkState.startInfo;
+        const hasFrames = Array.isArray(chunkState.blendshape) && chunkState.blendshape.length > 0;
+        const chunkSession = chunkState.session;
+        console.log('[NeuroSync] schedule check', {
+            chunk: chunkState.index + 1,
+            hasStartInfo,
+            hasFrames,
+            scheduled: chunkState.scheduled,
+            chunkSession,
+            currentSession: currentSessionId,
+            timerCount: scheduledTimers.size
+        });
+        if (chunkState.scheduled) {
+            /* console.log('[NeuroSync] schedule skip', {
+                chunk: chunkState.index + 1,
+                reason: 'already scheduled'
+            }); */
+            return;
+        }
+        if (!chunkState.startInfo) {
+            const fallbackContext = state.streamingContext?.audioContext;
+            if (fallbackContext) {
+                const fallbackStartTime = fallbackContext.currentTime;
+                chunkState.startInfo = {
+                    startTime: fallbackStartTime,
+                    audioContext: fallbackContext,
+                    fallback: true
+                };
+                console.log('[NeuroSync] schedule fallback startInfo', {
+                    chunk: chunkState.index + 1,
+                    startTime: fallbackStartTime
+                });
+            } else {
+                console.log('[NeuroSync] schedule blocked (missing startInfo)', {
+                    chunk: chunkState.index + 1,
+                    framesReady: hasFrames
+                });
+                return;
+            }
+        }
+        if (chunkState.session !== currentSessionId) {
+            console.log('[NeuroSync] schedule skip', {
+                chunk: chunkState.index + 1,
+                reason: 'stale session',
+                chunkSession: chunkState.session,
+                currentSession: currentSessionId
+            });
+            return;
+        }
         const frames = chunkState.blendshape;
-        if (!frames || !frames.length) return;
+        if (!frames || !frames.length) {
+            console.log('[NeuroSync] schedule blocked (no frames)', {
+                chunk: chunkState.index + 1
+            });
+            return;
+        }
 
         const viewer = state.blendshapeViewer;
         if (!viewer || typeof viewer.applyBlendshapeFrame !== 'function') return;
 
         const { startTime, audioContext } = chunkState.startInfo;
 
-        const firstFrame = frames[0]?.values || {};
+        // const firstFrame = frames[0]?.values || {};
+        /*
         const sampleEntries = Object.entries(firstFrame)
             .slice(0, 6)
             .map(([k, v]) => `${k}:${Number(v).toFixed(3)}`);
+        const frameDiagnostics = frames.slice(0, 3).map(frame => {
+            const values = frame.values || {};
+            let nonZeroCount = 0;
+            const nonBlinkNonZero = [];
+            Object.entries(values).forEach(([key, value]) => {
+                const numeric = Number(value) || 0;
+                if (Math.abs(numeric) > 1e-6) {
+                    nonZeroCount += 1;
+                    const isBlinkKey = key.toLowerCase().includes('blink');
+                    if (!isBlinkKey && nonBlinkNonZero.length < 5) {
+                        nonBlinkNonZero.push({ key, value: Number(numeric.toFixed(3)) });
+                    }
+                }
+            });
+            return {
+                time: frame.time,
+                nonZeroCount,
+                sample: nonBlinkNonZero
+            };
+        });
         console.log('[NeuroSync] schedule chunk', chunkState.index + 1, sampleEntries.join(', '), 'timeOffset', frames[0]?.time ?? 0);
+        console.log('[NeuroSync] schedule chunk diagnostics', chunkState.index + 1, frameDiagnostics);
+        */
 
         frames.forEach(frame => {
             const delay = Math.max(0, frame.time);
@@ -265,6 +349,13 @@ export function initNeuroSyncForwarder({
             const msDelay = Math.max(0, (targetTime - audioContext.currentTime) * 1000);
             const timerId = setTimeout(() => {
                 scheduledTimers.delete(timerId);
+                const summary = summarizeFrameValues(frame.values);
+                console.log('[NeuroSync] frame dispatch', {
+                    chunk: chunkState.index + 1,
+                    time: frame.time,
+                    nonZeroCount: summary.nonZeroCount,
+                    sample: summary.sample
+                });
                 try {
                     viewer.applyBlendshapeFrame(frame.values);
                 } catch (error) {
@@ -377,16 +468,44 @@ export function initNeuroSyncForwarder({
         if (!chunkState || chunkState.session !== currentSessionId) {
             return null;
         }
+        console.log('[NeuroSync] playback listener registered', {
+            chunk: chunkInfo.index + 1,
+            chunkStateFound: !!chunkState,
+            chunkSession: chunkState?.session,
+            currentSession: currentSessionId
+        });
+        const beforePlayPromise = Promise.race([
+            chunkState.promise.catch(() => []),
+            new Promise(resolve => setTimeout(resolve, 250))
+        ]);
+        beforePlayPromise
+            .then(frames => {
+                console.log('[NeuroSync] beforePlay resolved', {
+                    chunk: chunkInfo.index + 1,
+                    frameCount: Array.isArray(frames) ? frames.length : 0
+                });
+            })
+            .catch(error => {
+                console.log('[NeuroSync] beforePlay error', {
+                    chunk: chunkInfo.index + 1,
+                    message: error?.message ?? String(error)
+                });
+            });
         return {
-            beforePlay: Promise.race([
-                chunkState.promise.catch(() => []),
-                new Promise(resolve => setTimeout(resolve, 250))
-            ]),
+            beforePlay: beforePlayPromise,
             onStart: ({ startTime, audioContext }) => {
                 chunkState.startInfo = { startTime, audioContext };
+                console.log('[NeuroSync] chunk start info', {
+                    chunk: chunkState.index + 1,
+                    startTime,
+                    audioTime: audioContext?.currentTime ?? null
+                });
                 scheduleChunkFrames(chunkState);
             },
             onEnd: () => {
+                console.log('[NeuroSync] chunk playback end', {
+                    chunk: chunkState.index + 1
+                });
                 chunkStates.delete(chunkInfo.index);
             }
         };
